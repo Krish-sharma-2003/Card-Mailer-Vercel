@@ -37,7 +37,11 @@ GMAIL_ADDRESS = env("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = env("GMAIL_APP_PASSWORD")
 SENDER_NAME = env("SENDER_NAME", "EkLabs")
 GEMINI_API_KEY = env("GEMINI_API_KEY")
-GEMINI_MODEL = env("GEMINI_MODEL", "gemini-2.5-flash")
+# Google retires Gemini models often (gemini-2.5-flash now returns 404).
+# GEMINI_MODEL is tried first; if it is gone (404) or out of quota (429),
+# the next one in the list is tried automatically.
+GEMINI_MODEL = env("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 SUPABASE_URL = env("SUPABASE_URL").rstrip("/")
 SUPABASE_KEY = env("SUPABASE_SERVICE_ROLE_KEY")
 SHEET_URL = env("SHEET_WEBHOOK_URL")
@@ -115,11 +119,18 @@ def tg_download(file_id: str) -> bytes:
 
 
 # ----------------------------- GEMINI ---------------------------------
-def gemini_extract(image: bytes, mime: str) -> dict:
+_working_model = None  # remembered while this serverless instance stays warm
+
+
+def _gemini_request(model: str, image: bytes, mime: str, low_thinking: bool):
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
+        f"{model}:generateContent"
     )
+    config = {"responseMimeType": "application/json", "temperature": 0}
+    if low_thinking:
+        # Keeps replies fast. Not every model accepts it, caller retries without.
+        config["thinkingConfig"] = {"thinkingLevel": "low"}
     body = {
         "contents": [
             {
@@ -134,20 +145,42 @@ def gemini_extract(image: bytes, mime: str) -> dict:
                 ]
             }
         ],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0,
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
+        "generationConfig": config,
     }
-    r = requests.post(
+    return requests.post(
         url,
         headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
         json=body,
-        timeout=45,
+        timeout=50,
     )
-    r.raise_for_status()
-    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def gemini_extract(image: bytes, mime: str) -> dict:
+    global _working_model
+    candidates = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
+    if _working_model in candidates:
+        candidates.remove(_working_model)
+        candidates.insert(0, _working_model)
+
+    last = None
+    for model in candidates:
+        r = _gemini_request(model, image, mime, low_thinking=True)
+        if r.status_code == 400:  # model may not support thinkingLevel
+            r = _gemini_request(model, image, mime, low_thinking=False)
+        if r.status_code in (404, 429):  # model retired, or no quota on this one
+            log.warning("Gemini model %s returned %s, trying next", model, r.status_code)
+            last = r
+            continue
+        r.raise_for_status()
+        _working_model = model
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return _parse_card(text)
+
+    last.raise_for_status()  # every model failed: surface the last error
+    raise RuntimeError("No Gemini model available")
+
+
+def _parse_card(text: str) -> dict:
     data = json.loads(text)
     if isinstance(data, list):
         data = data[0] if data else {}
